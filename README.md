@@ -135,12 +135,15 @@ cd unitree_mujoco/simulate/build
 # ./unitree_mujoco -i 0 -n eth0 -r go2 -s scene_go2.xml # alternative (example)
 ```
 
+1. Run with joystick(default):
+
 ```bash
 cd unitree_rl_lab/deploy/robots/go2/build
-./go2_ctrl -n lo
+./go2_ctrl -n lo 
+# or ./go2_ctrl --network lo
 ```
 
-Run with keyboard mapping:
+2. Run with keyboard mapping:
 
 ```bash
 ./go2_ctrl_keyboard -n lo
@@ -169,7 +172,7 @@ The policy directory must contain:
 You can use this program to control the robot directly, but make sure the on-borad control program has been closed.
 
 ```bash
-./go2_ctrl --network eth0 # eth0 is the network interface name.
+./go2_ctrl --network enp4s0 # enp4s0(or eth0) is the network interface name.
 # go2_ctrl is joystick-only
 # go2_ctrl_keyboard enables keyboard mapping:
 #   f: LT + A (FixStand)
