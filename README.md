@@ -84,11 +84,6 @@ Currently supports Unitree **Go2**, **H1** and **G1-29dof** robots.
     # same as
     python scripts/rsl_rl/play.py --task Unitree-G1-29dof-Velocity
     ```
-  - TensorBoard:
-
-    ```bash
-    tensorboard --logdir=./logs/rsl_rl
-    ```
 
 ### Train Go2 Stairs Policy
 
