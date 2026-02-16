@@ -73,16 +73,16 @@ Currently supports Unitree **Go2**, **H1** and **G1-29dof** robots.
   - Running a task:
 
     ```bash
-    ./unitree_rl_lab.sh -t --task Unitree-Go2-Stairs # support for autocomplete task-name
+    ./unitree_rl_lab.sh -t --task Unitree-G1-29dof-Velocity # support for autocomplete task-name
     # same as
-    python scripts/rsl_rl/train.py --headless --task Unitree-Go2-Stairs --max_iterations 300000
+    python scripts/rsl_rl/train.py --headless --task Unitree-G1-29dof-Velocity
     ```
   - Inference with a trained agent:
 
     ```bash
-    ./unitree_rl_lab.sh -p --task Unitree-Go2-Stairs # support for autocomplete task-name
+    ./unitree_rl_lab.sh -p --task Unitree-G1-29dof-Velocity # support for autocomplete task-name
     # same as
-    python scripts/rsl_rl/play.py --task Unitree-Go2-Stairs
+    python scripts/rsl_rl/play.py --task Unitree-G1-29dof-Velocity
     ```
   - TensorBoard:
 
@@ -122,16 +122,6 @@ sudo make install
 cd unitree_rl_lab/deploy/robots/go2
 mkdir build && cd build
 cmake .. && make
-```
-
-### Go2 Keyboard/Joystick Control
-
-Build the Go2 deploy binary:
-
-```bash
-cd deploy/robots/go2
-mkdir -p build && cd build
-cmake .. && make -j
 ```
 
 ### Sim2Sim
