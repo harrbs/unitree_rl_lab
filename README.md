@@ -73,17 +73,34 @@ Currently supports Unitree **Go2**, **H1** and **G1-29dof** robots.
   - Running a task:
 
     ```bash
-    ./unitree_rl_lab.sh -t --task Unitree-G1-29dof-Velocity # support for autocomplete task-name
+    ./unitree_rl_lab.sh -t --task Unitree-Go2-Stairs # support for autocomplete task-name
     # same as
-    python scripts/rsl_rl/train.py --headless --task Unitree-G1-29dof-Velocity
+    python scripts/rsl_rl/train.py --headless --task Unitree-Go2-Stairs --max_iterations 300000
     ```
   - Inference with a trained agent:
 
     ```bash
-    ./unitree_rl_lab.sh -p --task Unitree-G1-29dof-Velocity # support for autocomplete task-name
+    ./unitree_rl_lab.sh -p --task Unitree-Go2-Stairs # support for autocomplete task-name
     # same as
-    python scripts/rsl_rl/play.py --task Unitree-G1-29dof-Velocity
+    python scripts/rsl_rl/play.py --task Unitree-Go2-Stairs
     ```
+  - TensorBoard:
+
+    ```bash
+    tensorboard --logdir=./logs/rsl_rl
+    ```
+
+### Train Go2 Stairs Policy
+
+```bash
+python scripts/rsl_rl/train.py --task Unitree-Go2-Stairs --headless --max_iterations 300000
+```
+
+TensorBoard:
+
+```bash
+tensorboard --logdir=./logs/rsl_rl
+```
 
 ## Deploy
 
@@ -102,16 +119,26 @@ mkdir build && cd build
 cmake .. -DBUILD_EXAMPLES=OFF # Install on the /usr/local directory
 sudo make install
 # Compile the robot_controller
-cd unitree_rl_lab/deploy/robots/g1_29dof # or other robots
+cd unitree_rl_lab/deploy/robots/go2
 mkdir build && cd build
 cmake .. && make
+```
+
+### Go2 Keyboard/Joystick Control
+
+Build the Go2 deploy binary:
+
+```bash
+cd deploy/robots/go2
+mkdir -p build && cd build
+cmake .. && make -j
 ```
 
 ### Sim2Sim
 
 Installing the [unitree_mujoco](https://github.com/unitreerobotics/unitree_mujoco?tab=readme-ov-file#installation).
 
-- Set the `robot` at `/simulate/config.yaml` to g1
+- Set the `robot` at `/simulate/config.yaml` to go2
 - Set `domain_id` to 0
 - Set `enable_elastic_hand` to 1
 - Set `use_joystck` to 1.
@@ -120,24 +147,50 @@ Installing the [unitree_mujoco](https://github.com/unitreerobotics/unitree_mujoc
 # start simulation
 cd unitree_mujoco/simulate/build
 ./unitree_mujoco
-# ./unitree_mujoco -i 0 -n eth0 -r g1 -s scene_29dof.xml # alternative
+# ./unitree_mujoco -i 0 -n eth0 -r go2 -s scene_go2.xml # alternative (example)
 ```
 
 ```bash
-cd unitree_rl_lab/deploy/robots/g1_29dof/build
-./g1_ctrl
-# 1. press [L2 + Up] to set the robot to stand up
-# 2. Click the mujoco window, and then press 8 to make the robot feet touch the ground.
-# 3. Press [R1 + X] to run the policy.
-# 4. Click the mujoco window, and then press 9 to disable the elastic band.
+cd unitree_rl_lab/deploy/robots/go2/build
+./go2_ctrl -n lo
 ```
+
+Run with keyboard mapping:
+
+```bash
+./go2_ctrl_keyboard -n lo
+```
+
+Keyboard shortcuts (when using `go2_ctrl_keyboard`):
+
+- `f`: LT + A (FixStand)
+- `g`: start (Velocity)
+- `h`: LT + B (Passive)
+- `w/a/s/d`, arrows, `q/e`: `ly/lx/rx` velocity commands
+
+### Run a New Locomotion Policy
+
+To run a new policy, update `FSM.Velocity.policy_dir` in:
+
+`deploy/robots/go2/config/config.yaml`
+
+The policy directory must contain:
+
+- `params/deploy.yaml`
+- `exported/policy.onnx`
 
 ### Sim2Real
 
 You can use this program to control the robot directly, but make sure the on-borad control program has been closed.
 
 ```bash
-./g1_ctrl --network eth0 # eth0 is the network interface name.
+./go2_ctrl --network eth0 # eth0 is the network interface name.
+# go2_ctrl is joystick-only
+# go2_ctrl_keyboard enables keyboard mapping:
+#   f: LT + A (FixStand)
+#   g: start (Velocity)
+#   h: LT + B (Passive)
+#   w/a/s/d, arrows, q/e: velocity commands
 ```
 
 ## Acknowledgements
