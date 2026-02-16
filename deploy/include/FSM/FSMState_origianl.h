@@ -6,6 +6,8 @@
 #include "isaaclab/devices/keyboard/keyboard.h"
 #include "unitree_joystick_dsl.hpp"
 
+// This file was origianl file that named FSMState.h
+
 class FSMState : public BaseState
 {
 public:
@@ -56,48 +58,7 @@ public:
     void pre_run()
     {
         lowstate->update();
-        // if(keyboard) keyboard->update();
-        if(keyboard)
-        {
-            keyboard->update();
-
-            auto &joy = lowstate->joystick;
-            const std::string key = keyboard->key();
-
-            const bool key_f = (key == "f");
-            const bool key_g = (key == "g");
-            const bool key_h = (key == "h");
-
-            // One-key shortcuts for FSM transitions.
-            joy.LT((key_f || key_h) ? 1.0f : 0.0f);
-            joy.A(key_f ? 1 : 0);
-            joy.B(key_h ? 1 : 0);
-            joy.start(key_g ? 1 : 0);
-
-            // WASD / arrow keys for velocity commands.
-            float ly = 0.0f;
-            float lx = 0.0f;
-            float rx = 0.0f;
-            float scale = 1.0f;
-            if(key == "w" || key == "up") {
-                ly = 1.0f * scale;
-            } else if(key == "s" || key == "down") {
-                ly = -1.0f * scale;
-            }
-            if(key == "a" || key == "left") {
-                lx = -1.0f * scale;
-            } else if(key == "d" || key == "right") {
-                lx = 1.0f * scale;
-            }
-            if(key == "q") {
-                rx = -1.0f * scale;
-            } else if(key == "e") {
-                rx = 1.0f * scale;
-            }
-            joy.ly(ly);
-            joy.lx(lx);
-            joy.rx(rx);
-        }
+        if(keyboard) keyboard->update();
     }
 
     void post_run()

@@ -5,7 +5,7 @@
 
 std::unique_ptr<LowCmd_t> FSMState::lowcmd = nullptr;
 std::shared_ptr<LowState_t> FSMState::lowstate = nullptr;
-std::shared_ptr<Keyboard> FSMState::keyboard = nullptr;
+std::shared_ptr<Keyboard> FSMState::keyboard = std::make_shared<Keyboard>();
 
 void init_fsm_state()
 {
@@ -30,7 +30,7 @@ int main(int argc, char** argv)
     auto vm = param::helper(argc, argv);
 
     std::cout << " --- Unitree Robotics --- \n";
-    std::cout << "     Go2 Controller \n";
+    std::cout << "     Go2 Controller (Keyboard) \n";
 
     // Unitree DDS Config
     unitree::robot::ChannelFactory::Instance()->Init(0, vm["network"].as<std::string>());
@@ -41,13 +41,16 @@ int main(int argc, char** argv)
     auto fsm = std::make_unique<CtrlFSM>(param::config["FSM"]);
     fsm->start();
 
-    std::cout << "Press [L2 + A] to enter FixStand mode.\n";
-    std::cout << "And then press [Start] to start controlling the robot.\n";
+    std::cout << "Keyboard shortcuts:\n";
+    std::cout << "  f  -> LT + A (FixStand)\n";
+    std::cout << "  g  -> Start (Velocity)\n";
+    std::cout << "  h  -> LT + B (Passive)\n";
+    std::cout << "  w/a/s/d or arrows -> velocity\n";
 
     while (true)
     {
         sleep(1);
     }
-    
+
     return 0;
 }

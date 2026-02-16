@@ -21,6 +21,8 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from unitree_rl_lab.assets.robots.unitree import UNITREE_GO2_CFG as ROBOT_CFG
 from unitree_rl_lab.tasks.locomotion import mdp
 
+
+# 기존 CFG
 COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
     size=(8.0, 8.0),
     border_width=20.0,
@@ -64,6 +66,45 @@ COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
     },
 )
 
+# 새로 만든 CFG
+STAIRS_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
+    size=(8.0, 8.0),
+    border_width=20.0,
+    num_rows=10,
+    num_cols=20,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    difficulty_range=(0.0, 1.0),
+    use_cache=False,
+    sub_terrains={
+        "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.20), # 0.25
+        "pyramid_stairs": terrain_gen.MeshPyramidStairsTerrainCfg(
+            proportion=0.40, # 0.45
+            step_height_range=(0.10, 0.25), # 단 높이를 범위에서 난이도에 따라 샘플링 (0.06, 0.15)
+            step_width=0.3, # 각 단의 수평 폭(깊이) 0.3
+            platform_width=2.0, # 계단 시작/중간/끝에 들어가는 평탄 구간 폭(안전 구간) 3.0
+            border_width=1.0, # 서브지형 가장자리에 두는 여유/테두리 폭
+            holes=False, # 계단 지형에 구멍(결손 타일)
+        ),
+        "pyramid_stairs_inv": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
+            proportion=0.40, # 0.30
+            step_height_range=(0.10, 0.25),
+            step_width=0.3,
+            platform_width=2.0,
+            border_width=1.0,
+            holes=False,
+        ),
+        # "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
+        #     proportion=0.10, noise_range=(0.01, 0.05), noise_step=0.01, border_width=0.25
+        # ),
+    },
+)
+
+
+
+
+
 
 @configclass
 class RobotSceneCfg(InteractiveSceneCfg):
@@ -73,7 +114,7 @@ class RobotSceneCfg(InteractiveSceneCfg):
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",  # "plane", "generator"
-        terrain_generator=COBBLESTONE_ROAD_CFG,  # None, ROUGH_TERRAINS_CFG
+        terrain_generator=STAIRS_TERRAIN_CFG,  # None, ROUGH_TERRAINS_CFG
         max_init_terrain_level=1,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
@@ -190,12 +231,14 @@ class CommandsCfg:
 
     base_velocity = mdp.UniformLevelVelocityCommandCfg(
         asset_name="robot",
-        resampling_time_range=(10.0, 10.0),
+        resampling_time_range=(10.0, 10.0), # 명령을 몇 초마다 바꿀지
         rel_standing_envs=0.1,
         debug_vis=True,
+        # 학습 시작 시 실제로 샘플링되는 명령 범위
         ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
             lin_vel_x=(-0.1, 0.1), lin_vel_y=(-0.1, 0.1), ang_vel_z=(-1, 1)
         ),
+        # 커리큘럼이 확장할 수 있는 최대 범위
         limit_ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
             lin_vel_x=(-1.0, 1.0), lin_vel_y=(-0.4, 0.4), ang_vel_z=(-1.0, 1.0)
         ),
@@ -230,6 +273,13 @@ class ObservationsCfg:
             func=mdp.joint_vel_rel, scale=0.05, clip=(-100, 100), noise=Unoise(n_min=-1.5, n_max=1.5)
         )
         last_action = ObsTerm(func=mdp.last_action, clip=(-100, 100))
+        height_scan = ObsTerm(
+            func=mdp.height_scan,
+            params={"sensor_cfg": SceneEntityCfg("height_scanner")},
+            scale=1.0,
+            noise=Unoise(n_min=-0.02, n_max=0.02),
+            clip=(-0.5, 2.0),
+        )
 
         def __post_init__(self):
             # self.history_length = 5
@@ -410,6 +460,6 @@ class RobotPlayEnvCfg(RobotEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.num_envs = 32
-        self.scene.terrain.terrain_generator.num_rows = 2
-        self.scene.terrain.terrain_generator.num_cols = 1
+        self.scene.terrain.terrain_generator.num_rows = 8 # 2
+        self.scene.terrain.terrain_generator.num_cols = 8 # 1
         self.commands.base_velocity.ranges = self.commands.base_velocity.limit_ranges

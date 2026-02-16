@@ -21,6 +21,8 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from unitree_rl_lab.assets.robots.unitree import UNITREE_GO2_CFG as ROBOT_CFG
 from unitree_rl_lab.tasks.locomotion import mdp
 
+
+# 기존 CFG
 COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
     size=(8.0, 8.0),
     border_width=20.0,
@@ -64,6 +66,41 @@ COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(
     },
 )
 
+# 새로 만든 CFG
+STAIRS_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
+      size=(8.0, 8.0),
+      border_width=20.0,
+      num_rows=10,
+      num_cols=20,
+      horizontal_scale=0.1,
+      vertical_scale=0.005,
+      slope_threshold=0.75,
+      difficulty_range=(0.0, 1.0),
+      use_cache=False,
+      sub_terrains={
+          "pyramid_stairs": terrain_gen.MeshPyramidStairsTerrainCfg(
+              proportion=0.6,
+              step_height_range=(0.05, 0.23),
+              step_width=0.3,
+              platform_width=3.0,
+              border_width=1.0,
+              holes=False,
+          ),
+          "pyramid_stairs_inv": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
+              proportion=0.4,
+              step_height_range=(0.05, 0.23),
+              step_width=0.3,
+              platform_width=3.0,
+              border_width=1.0,
+              holes=False,
+          ),
+      },
+  )
+
+
+
+
+
 
 @configclass
 class RobotSceneCfg(InteractiveSceneCfg):
@@ -73,7 +110,7 @@ class RobotSceneCfg(InteractiveSceneCfg):
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",  # "plane", "generator"
-        terrain_generator=COBBLESTONE_ROAD_CFG,  # None, ROUGH_TERRAINS_CFG
+        terrain_generator=STAIRS_TERRAIN_CFG,  # None, ROUGH_TERRAINS_CFG
         max_init_terrain_level=1,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
