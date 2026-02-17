@@ -28,3 +28,4 @@ link_libraries(${PROJECT_NAME}_lib)
 
 add_executable(go2_ctrl main.cpp)
 add_executable(go2_ctrl_keyboard main_keyboard.cpp)
+add_executable(go2_ctrl_toggle main_toggle.cpp)
