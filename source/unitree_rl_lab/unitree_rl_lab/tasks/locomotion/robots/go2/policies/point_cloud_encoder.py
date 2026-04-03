@@ -1,0 +1,88 @@
+"""PointNet-style encoder for local terrain point clouds.
+
+Replaces StepEdgeExtractor + StepEdgeEncoderMLP in Baseline E.
+
+Key differences vs StepEdgeExtractor
+--------------------------------------
+* StepEdgeExtractor: closed-form, interpretable, 0 learned params.
+  Input: (N, 96) projected heights.
+  Output: 4 explicit geometric features → 64-dim latent.
+
+* PointCloudEncoder: learned, end-to-end, ~24K params.
+  Input: (N, 288) = (N, 96×3) raw 3-D hit positions in robot frame.
+  Output: 64-dim latent.
+
+  Advantages:
+    - No manual grid projection needed at deployment.
+    - Works with any LiDAR pattern (not just grid).
+    - Learns optimal feature extraction for stair geometry.
+    - Order-invariant via max pooling (robust to point ordering).
+
+Architecture (PointNet-lite)
+-----------------------------
+    per-point MLP  :  3 → 32 → 64 → 128       (shared across all points)
+    global max pool:  (N, P, 128) → (N, 128)
+    output MLP     :  128 → 64
+
+Total parameters: ~24K
+
+Deployment
+-----------
+Real robot: filter Mid360 point cloud to ROI, subsample/voxelise to 96
+points, transform to robot base frame → reshape to (1, 288) → encoder.
+No grid projection or height-value computation needed.
+
+MuJoCo sim2sim: configure rangefinder array or depth camera, back-project
+to 3-D points in robot frame → same encoder.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+
+class PointCloudEncoder(nn.Module):
+    """PointNet-lite encoder: (N, P*3) → (N, out_dim).
+
+    Args:
+        num_points:  Number of LiDAR points P (default 96, from 12×8 grid).
+        out_dim:     Dimension of output latent vector (default 64).
+    """
+
+    def __init__(self, num_points: int = 96, out_dim: int = 64) -> None:
+        super().__init__()
+        self.P = num_points
+        self.out_dim = out_dim
+
+        # ── Per-point feature extraction (shared MLP, applied to each point) ─
+        self.point_mlp = nn.Sequential(
+            nn.Linear(3,   32),  nn.ELU(),
+            nn.Linear(32,  64),  nn.ELU(),
+            nn.Linear(64, 128),  nn.ELU(),
+        )
+
+        # ── Global feature compression ────────────────────────────────────────
+        self.global_mlp = nn.Sequential(
+            nn.Linear(128, out_dim), nn.ELU(),
+        )
+
+        total = sum(p.numel() for p in self.parameters())
+        print(f"PointCloudEncoder: P={num_points}, out_dim={out_dim}, "
+              f"params={total:,}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode a batch of point clouds.
+
+        Args:
+            x: (N, P*3) flattened point cloud in robot base frame.
+               Also accepts (T*N, P*3) for recurrent PPO batch updates.
+
+        Returns:
+            (N, out_dim) global terrain feature vector.
+        """
+        N = x.shape[0]
+        pts  = x.reshape(N, self.P, 3)           # (N, P, 3)
+        feat = self.point_mlp(pts)               # (N, P, 128)  per-point features
+        glob = feat.max(dim=1)[0]                # (N, 128)     global max pool
+        return self.global_mlp(glob)             # (N, out_dim)

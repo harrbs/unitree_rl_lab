@@ -1,0 +1,538 @@
+"""Actor-Critic policies for the stair-aware locomotion ablation study.
+
+Observation group convention:
+  obs["policy"]     (45 dim)  — actor proprioception (no lin_vel)
+  obs["height"]     (96 dim)  — projected height scan      (Baselines C, D)
+  obs["pointcloud"] (288 dim) — raw 3-D hits in robot frame (Baseline E)
+  obs["critic"]     (60 dim)  — privileged critic obs (sim only)
+
+Architectures:
+  C: GRU(policy→256) + CNN(height→64)       → Fusion[320→256→128→12]
+  D: GRU(policy→256) + StepEdge(height→64)  → Fusion[320→256→128→12]
+  E: GRU(policy→256) + PointNet(pc→64)      → Fusion[320→256→128→12]
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+from tensordict import TensorDict
+from torch.distributions import Normal
+from typing import Any, NoReturn
+
+from rsl_rl.networks import HiddenState, Memory
+from rsl_rl.utils import unpad_trajectories
+
+from .point_cloud_encoder import PointCloudEncoder
+from .step_edge_extractor import StepEdgeEncoderMLP
+
+
+def _make_activation(name: str) -> nn.Module:
+    acts = {"elu": nn.ELU(), "relu": nn.ReLU(), "tanh": nn.Tanh(), "selu": nn.SELU()}
+    if name not in acts:
+        raise ValueError(f"Unknown activation '{name}'")
+    return acts[name]
+
+
+def _make_mlp(in_dim: int, hidden_dims: list[int], activation: str) -> nn.Sequential:
+    layers: list[nn.Module] = []
+    cur = in_dim
+    for h in hidden_dims:
+        layers += [nn.Linear(cur, h), _make_activation(activation)]
+        cur = h
+    return nn.Sequential(*layers)
+
+
+class StairAwareActorCritic(nn.Module):
+    """GRU(prop) + StepEdgeExtractor(height) + Fusion MLP Actor-Critic.
+
+    Asymmetric actor-critic:
+      Actor  uses obs["policy"] + obs["height"]  — deployable on real robot
+      Critic uses obs["critic"] + obs["height"]  — privileged sim obs
+    """
+
+    is_recurrent: bool = True
+
+    def __init__(
+        self,
+        obs: TensorDict,
+        obs_groups: dict[str, list[str]],
+        num_actions: int,
+        actor_hidden_dims: list[int] = [256, 128],
+        critic_hidden_dims: list[int] = [256, 128],
+        activation: str = "elu",
+        init_noise_std: float = 1.0,
+        noise_std_type: str = "scalar",
+        gru_hidden_dim: int = 256,
+        stair_hidden_dim: int = 64,
+        **kwargs: Any,
+    ) -> None:
+        if kwargs:
+            print(f"StairAwareActorCritic: ignoring unexpected kwargs {list(kwargs)}")
+        super().__init__()
+
+        self.obs_groups = obs_groups
+        self.noise_std_type = noise_std_type
+
+        num_prop_a = obs["policy"].shape[-1]   # 45 dim — actor prop
+        num_prop_c = obs["critic"].shape[-1]   # 60 dim — privileged critic prop
+        num_height = obs["height"].shape[-1]   # 96 dim
+        z_fused    = gru_hidden_dim + stair_hidden_dim  # 320
+
+        # ── Actor ──────────────────────────────────────────────────────────
+        self.memory_a    = Memory(num_prop_a, gru_hidden_dim, num_layers=1, type="gru")
+        self.stair_enc_a = StepEdgeEncoderMLP(hidden_dim=stair_hidden_dim)
+        self.fusion_a    = _make_mlp(z_fused, actor_hidden_dims, activation)
+        self.actor_head  = nn.Linear(actor_hidden_dims[-1], num_actions)
+
+        # ── Critic ─────────────────────────────────────────────────────────
+        self.memory_c    = Memory(num_prop_c, gru_hidden_dim, num_layers=1, type="gru")
+        self.stair_enc_c = StepEdgeEncoderMLP(hidden_dim=stair_hidden_dim)
+        self.fusion_c    = _make_mlp(z_fused, critic_hidden_dims, activation)
+        self.critic_head = nn.Linear(critic_hidden_dims[-1], 1)
+
+        # ── Auxiliary: linear velocity decoder ─────────────────────────────
+        # Supervises the actor GRU to estimate base_lin_vel from prop history.
+        # Used only during training; discarded at deployment.
+        self.vel_decoder = nn.Sequential(
+            nn.Linear(gru_hidden_dim, 64),
+            nn.ELU(),
+            nn.Linear(64, 3),
+        )
+
+        # ── Noise ──────────────────────────────────────────────────────────
+        if noise_std_type == "scalar":
+            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        elif noise_std_type == "log":
+            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+        else:
+            raise ValueError(f"Unknown noise_std_type: {noise_std_type}")
+
+        self.distribution: Normal | None = None
+        Normal.set_default_validate_args(False)
+
+        print(f"StairAwareActorCritic (asymmetric):")
+        print(f"  actor_prop={num_prop_a}, critic_prop={num_prop_c}, height={num_height}")
+        print(f"  GRU={gru_hidden_dim}, stair_enc={stair_hidden_dim}, fused={z_fused}")
+        print(f"  actor_fusion={actor_hidden_dims}, critic_fusion={critic_hidden_dims}")
+        print(f"  vel_decoder={gru_hidden_dim}→64→3  (aux supervised loss)")
+
+    # ── Properties ─────────────────────────────────────────────────────────
+
+    @property
+    def action_mean(self) -> torch.Tensor:
+        return self.distribution.mean
+
+    @property
+    def action_std(self) -> torch.Tensor:
+        return self.distribution.stddev
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        return self.distribution.entropy().sum(dim=-1)
+
+    # ── Helpers ────────────────────────────────────────────────────────────
+
+    def _encode_height(self, enc: nn.Module, height: torch.Tensor, masks) -> torch.Tensor:
+        """Handle both inference (2-D) and recurrent batch-update (3-D) shapes."""
+        if masks is not None:
+            T_pad, N_traj, D_h = height.shape
+            z = enc(height.reshape(T_pad * N_traj, D_h))
+            z = z.reshape(T_pad, N_traj, -1)
+            return unpad_trajectories(z, masks)
+        return enc(height)
+
+    def _update_distribution(self, mean: torch.Tensor) -> None:
+        std = self.std.expand_as(mean) if self.noise_std_type == "scalar" else torch.exp(self.log_std).expand_as(mean)
+        self.distribution = Normal(mean, std)
+
+    # ── Forward ────────────────────────────────────────────────────────────
+
+    def _actor_forward(self, obs, masks=None, hidden_state=None):
+        z_prop  = self.memory_a(obs["policy"], masks, hidden_state).squeeze(0)
+        z_stair = self._encode_height(self.stair_enc_a, obs["height"], masks)
+        return self.actor_head(self.fusion_a(torch.cat([z_prop, z_stair], dim=-1)))
+
+    def _critic_forward(self, obs, masks=None, hidden_state=None):
+        # Critic uses privileged obs["critic"] directly (already includes lin_vel)
+        z_prop  = self.memory_c(obs["critic"], masks, hidden_state).squeeze(0)
+        z_stair = self._encode_height(self.stair_enc_c, obs["height"], masks)
+        return self.critic_head(self.fusion_c(torch.cat([z_prop, z_stair], dim=-1)))
+
+    # ── Public interface ────────────────────────────────────────────────────
+
+    def reset(self, dones=None):
+        self.memory_a.reset(dones)
+        self.memory_c.reset(dones)
+
+    def forward(self) -> NoReturn:
+        raise NotImplementedError
+
+    def act(self, obs, masks=None, hidden_state=None):
+        mean = self._actor_forward(obs, masks, hidden_state)
+        self._update_distribution(mean)
+        return self.distribution.sample()
+
+    def act_inference(self, obs):
+        return self._actor_forward(obs)
+
+    def evaluate(self, obs, masks=None, hidden_state=None):
+        return self._critic_forward(obs, masks, hidden_state)
+
+    def get_actions_log_prob(self, actions):
+        return self.distribution.log_prob(actions).sum(dim=-1)
+
+    def get_hidden_states(self):
+        return self.memory_a.hidden_state, self.memory_c.hidden_state
+
+    def predict_lin_vel(self, policy_seq: torch.Tensor) -> torch.Tensor:
+        """Predict linear velocity from a proprioceptive sequence (aux loss).
+
+        Resets the actor GRU hidden state internally — call only outside
+        the rollout loop (e.g. after alg.update()).
+
+        Args:
+            policy_seq: (T, N, prop_dim) sequence of policy observations.
+        Returns:
+            (N, 3) predicted linear velocity.
+        """
+        self.memory_a.reset()
+        z = self.memory_a(policy_seq)                          # (T, N, gru_hidden_dim)
+        z_last = z[-1] if z.dim() == 3 else z.squeeze(0)      # (N, gru_hidden_dim)
+        return self.vel_decoder(z_last)                        # (N, 3)
+
+    def update_normalization(self, obs):
+        pass
+
+    def load_state_dict(self, state_dict, strict=True):
+        super().load_state_dict(state_dict, strict=strict)
+        return True
+
+
+class _CNNHeightEncoder(nn.Module):
+    def __init__(self, grid_rows: int = 12, grid_cols: int = 8, out_dim: int = 64) -> None:
+        super().__init__()
+        self.H = grid_rows
+        self.W = grid_cols
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1), nn.ELU(),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.ELU(),
+            nn.Flatten(),
+        )
+        self.fc = nn.Sequential(nn.Linear(32 * grid_rows * grid_cols, out_dim), nn.ELU())
+
+    def forward(self, height_scan: torch.Tensor) -> torch.Tensor:
+        N = height_scan.shape[0]
+        return self.fc(self.cnn(height_scan.reshape(N, 1, self.H, self.W)))
+
+
+class GRUCNNActorCritic(nn.Module):
+    """GRU(prop) + CNN(height) + MLP Actor-Critic (Baseline C)."""
+
+    is_recurrent: bool = True
+
+    def __init__(
+        self,
+        obs: TensorDict,
+        obs_groups: dict[str, list[str]],
+        num_actions: int,
+        actor_hidden_dims: list[int] = [256, 128],
+        critic_hidden_dims: list[int] = [256, 128],
+        activation: str = "elu",
+        init_noise_std: float = 1.0,
+        noise_std_type: str = "scalar",
+        gru_hidden_dim: int = 256,
+        cnn_out_dim: int = 64,
+        **kwargs: Any,
+    ) -> None:
+        if kwargs:
+            print(f"GRUCNNActorCritic: ignoring unexpected kwargs {list(kwargs)}")
+        super().__init__()
+
+        self.obs_groups = obs_groups
+        self.noise_std_type = noise_std_type
+
+        num_prop_a = obs["policy"].shape[-1]
+        num_prop_c = obs["critic"].shape[-1]
+        z_fused = gru_hidden_dim + cnn_out_dim
+
+        self.memory_a   = Memory(num_prop_a, gru_hidden_dim, num_layers=1, type="gru")
+        self.cnn_enc_a  = _CNNHeightEncoder(out_dim=cnn_out_dim)
+        self.fusion_a   = _make_mlp(z_fused, actor_hidden_dims, activation)
+        self.actor_head = nn.Linear(actor_hidden_dims[-1], num_actions)
+
+        self.memory_c   = Memory(num_prop_c, gru_hidden_dim, num_layers=1, type="gru")
+        self.cnn_enc_c  = _CNNHeightEncoder(out_dim=cnn_out_dim)
+        self.fusion_c   = _make_mlp(z_fused, critic_hidden_dims, activation)
+        self.critic_head = nn.Linear(critic_hidden_dims[-1], 1)
+
+        # ── Auxiliary: linear velocity decoder ─────────────────────────────
+        self.vel_decoder = nn.Sequential(
+            nn.Linear(gru_hidden_dim, 64),
+            nn.ELU(),
+            nn.Linear(64, 3),
+        )
+
+        if noise_std_type == "scalar":
+            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        else:
+            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+
+        self.distribution: Normal | None = None
+        Normal.set_default_validate_args(False)
+
+        print(f"GRUCNNActorCritic (Baseline C, asymmetric):")
+        print(f"  actor_prop={num_prop_a}, critic_prop={num_prop_c}, height=96")
+
+    @property
+    def action_mean(self): return self.distribution.mean
+    @property
+    def action_std(self): return self.distribution.stddev
+    @property
+    def entropy(self): return self.distribution.entropy().sum(dim=-1)
+
+    @staticmethod
+    def _encode_cnn(enc, height, masks):
+        if masks is not None:
+            T_pad, N_traj, D_h = height.shape
+            z = enc(height.reshape(T_pad * N_traj, D_h))
+            z = z.reshape(T_pad, N_traj, -1)
+            return unpad_trajectories(z, masks)
+        return enc(height)
+
+    def _actor_forward(self, obs, masks=None, hidden_state=None):
+        z_prop = self.memory_a(obs["policy"], masks, hidden_state).squeeze(0)
+        z_cnn  = self._encode_cnn(self.cnn_enc_a, obs["height"], masks)
+        return self.actor_head(self.fusion_a(torch.cat([z_prop, z_cnn], dim=-1)))
+
+    def _critic_forward(self, obs, masks=None, hidden_state=None):
+        z_prop = self.memory_c(obs["critic"], masks, hidden_state).squeeze(0)
+        z_cnn  = self._encode_cnn(self.cnn_enc_c, obs["height"], masks)
+        return self.critic_head(self.fusion_c(torch.cat([z_prop, z_cnn], dim=-1)))
+
+    def _update_distribution(self, mean):
+        std = self.std.expand_as(mean) if self.noise_std_type == "scalar" else torch.exp(self.log_std).expand_as(mean)
+        self.distribution = Normal(mean, std)
+
+    def reset(self, dones=None):
+        self.memory_a.reset(dones)
+        self.memory_c.reset(dones)
+
+    def forward(self) -> NoReturn: raise NotImplementedError
+
+    def act(self, obs, masks=None, hidden_state=None):
+        mean = self._actor_forward(obs, masks, hidden_state)
+        self._update_distribution(mean)
+        return self.distribution.sample()
+
+    def act_inference(self, obs): return self._actor_forward(obs)
+    def evaluate(self, obs, masks=None, hidden_state=None): return self._critic_forward(obs, masks, hidden_state)
+    def get_actions_log_prob(self, actions): return self.distribution.log_prob(actions).sum(dim=-1)
+    def get_hidden_states(self): return self.memory_a.hidden_state, self.memory_c.hidden_state
+
+    def predict_lin_vel(self, policy_seq: torch.Tensor) -> torch.Tensor:
+        """Predict linear velocity from proprioceptive sequence (aux loss).
+
+        Args:
+            policy_seq: (T, N, prop_dim)
+        Returns:
+            (N, 3) predicted linear velocity.
+        """
+        self.memory_a.reset()
+        z = self.memory_a(policy_seq)
+        z_last = z[-1] if z.dim() == 3 else z.squeeze(0)
+        return self.vel_decoder(z_last)
+
+    def update_normalization(self, obs): pass
+    def load_state_dict(self, state_dict, strict=True):
+        super().load_state_dict(state_dict, strict=strict)
+        return True
+
+
+class PointCloudActorCritic(nn.Module):
+    """Terrain-memory actor-critic with blended point-cloud observations.
+
+    Actor pathway:
+      obs["pointcloud"] -> PointCloudEncoder -> z_pc (64)
+      concat(obs["policy"], z_pc) -> GRU(256) -> z_rnn
+      concat(z_rnn, z_pc) -> Fusion MLP -> actions
+
+    Critic mirrors the same structure but uses obs["critic"] as privileged
+    proprioception input. Deployment still consumes point clouds in robot base
+    frame, while training can schedule a blend between reference terrain points
+    and LiDAR-like partial observations.
+    """
+
+    is_recurrent: bool = True
+
+    def __init__(
+        self,
+        obs: TensorDict,
+        obs_groups: dict[str, list[str]],
+        num_actions: int,
+        actor_hidden_dims:  list[int] = [256, 128],
+        critic_hidden_dims: list[int] = [256, 128],
+        activation:      str   = "elu",
+        init_noise_std:  float = 1.0,
+        noise_std_type:  str   = "scalar",
+        gru_hidden_dim:  int   = 256,
+        pc_out_dim:      int   = 64,
+        **kwargs: Any,
+    ) -> None:
+        if kwargs:
+            print(f"PointCloudActorCritic: ignoring unexpected kwargs {list(kwargs)}")
+        super().__init__()
+
+        self.obs_groups    = obs_groups
+        self.noise_std_type = noise_std_type
+
+        num_prop_a = obs["policy"].shape[-1]       # 45
+        num_prop_c = obs["critic"].shape[-1]       # 60
+        num_pc = obs["pointcloud"].shape[-1]       # 288 = 96×3
+        num_points = num_pc // 3                   # 96
+        num_gru_a = num_prop_a + pc_out_dim        # 109
+        num_gru_c = num_prop_c + pc_out_dim        # 124
+        z_fused = gru_hidden_dim + pc_out_dim      # 320
+
+        # ── Actor ──────────────────────────────────────────────────────────
+        self.memory_a = Memory(num_gru_a, gru_hidden_dim, num_layers=1, type="gru")
+        self.pc_enc_a  = PointCloudEncoder(num_points=num_points, out_dim=pc_out_dim)
+        self.fusion_a  = _make_mlp(z_fused, actor_hidden_dims, activation)
+        self.actor_head = nn.Linear(actor_hidden_dims[-1], num_actions)
+
+        # ── Critic ─────────────────────────────────────────────────────────
+        self.memory_c = Memory(num_gru_c, gru_hidden_dim, num_layers=1, type="gru")
+        self.pc_enc_c  = PointCloudEncoder(num_points=num_points, out_dim=pc_out_dim)
+        self.fusion_c  = _make_mlp(z_fused, critic_hidden_dims, activation)
+        self.critic_head = nn.Linear(critic_hidden_dims[-1], 1)
+
+        # ── Auxiliary: linear velocity decoder ─────────────────────────────
+        self.vel_decoder = nn.Sequential(
+            nn.Linear(gru_hidden_dim, 64),
+            nn.ELU(),
+            nn.Linear(64, 3),
+        )
+
+        # ── Noise ──────────────────────────────────────────────────────────
+        if noise_std_type == "scalar":
+            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        elif noise_std_type == "log":
+            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+        else:
+            raise ValueError(f"Unknown noise_std_type: {noise_std_type}")
+
+        self.distribution: Normal | None = None
+        Normal.set_default_validate_args(False)
+
+        print(f"PointCloudActorCritic (Baseline E, asymmetric):")
+        print(f"  actor_prop={num_prop_a}, critic_prop={num_prop_c}, "
+              f"pointcloud={num_pc} ({num_points}pts×3)")
+        print(f"  concat(policy,z_pc)→GRU: actor_in={num_gru_a}, critic_in={num_gru_c}")
+        print(f"  GRU={gru_hidden_dim}, pc_enc→{pc_out_dim}, fused={z_fused}")
+        print(f"  actor_fusion={actor_hidden_dims}, critic_fusion={critic_hidden_dims}")
+        print(f"  vel_decoder={gru_hidden_dim}→64→3  (aux supervised loss)")
+
+    # ── Properties ─────────────────────────────────────────────────────────
+
+    @property
+    def action_mean(self) -> torch.Tensor:
+        return self.distribution.mean
+
+    @property
+    def action_std(self) -> torch.Tensor:
+        return self.distribution.stddev
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        return self.distribution.entropy().sum(dim=-1)
+
+    # ── Helpers ────────────────────────────────────────────────────────────
+
+    def _encode_pc(self, enc: nn.Module, pc: torch.Tensor, masks) -> torch.Tensor:
+        """Handle both inference (2-D) and recurrent batch-update (3-D) shapes."""
+        if masks is not None:
+            T_pad, N_traj, D = pc.shape
+            z = enc(pc.reshape(T_pad * N_traj, D))
+            return z.reshape(T_pad, N_traj, -1)
+        return enc(pc)
+
+    def _update_distribution(self, mean: torch.Tensor) -> None:
+        std = (self.std.expand_as(mean) if self.noise_std_type == "scalar"
+               else torch.exp(self.log_std).expand_as(mean))
+        self.distribution = Normal(mean, std)
+
+    # ── Forward ────────────────────────────────────────────────────────────
+
+    def _actor_forward(self, obs, masks=None, hidden_state=None):
+        z_pc = self._encode_pc(self.pc_enc_a, obs["pointcloud"], masks)
+        gru_in = torch.cat([obs["policy"], z_pc], dim=-1)
+        z_rnn = self.memory_a(gru_in, masks, hidden_state).squeeze(0)
+        if masks is not None:
+            z_pc = unpad_trajectories(z_pc, masks)
+        return self.actor_head(self.fusion_a(torch.cat([z_rnn, z_pc], dim=-1)))
+
+    def _critic_forward(self, obs, masks=None, hidden_state=None):
+        z_pc = self._encode_pc(self.pc_enc_c, obs["pointcloud"], masks)
+        gru_in = torch.cat([obs["critic"], z_pc], dim=-1)
+        z_rnn = self.memory_c(gru_in, masks, hidden_state).squeeze(0)
+        if masks is not None:
+            z_pc = unpad_trajectories(z_pc, masks)
+        return self.critic_head(self.fusion_c(torch.cat([z_rnn, z_pc], dim=-1)))
+
+    # ── Public interface ────────────────────────────────────────────────────
+
+    def reset(self, dones=None):
+        self.memory_a.reset(dones)
+        self.memory_c.reset(dones)
+
+    def forward(self) -> NoReturn:
+        raise NotImplementedError
+
+    def act(self, obs, masks=None, hidden_state=None):
+        mean = self._actor_forward(obs, masks, hidden_state)
+        self._update_distribution(mean)
+        return self.distribution.sample()
+
+    def act_inference(self, obs):
+        return self._actor_forward(obs)
+
+    def evaluate(self, obs, masks=None, hidden_state=None):
+        return self._critic_forward(obs, masks, hidden_state)
+
+    def get_actions_log_prob(self, actions):
+        return self.distribution.log_prob(actions).sum(dim=-1)
+
+    def get_hidden_states(self):
+        return self.memory_a.hidden_state, self.memory_c.hidden_state
+
+    def predict_lin_vel(self, policy_seq: torch.Tensor, zero_pointcloud: bool = True) -> torch.Tensor:
+        """Predict linear velocity from recurrent actor input (aux loss).
+
+        Args:
+            policy_seq: (T, N, prop_dim)
+            zero_pointcloud: if True, set z_pc = 0 to train memory without
+                exteroceptive support.
+        Returns:
+            (N, 3) predicted linear velocity.
+        """
+        self.memory_a.reset()
+        t_steps, n_envs, _ = policy_seq.shape
+        if zero_pointcloud:
+            z_pc = torch.zeros(
+                t_steps,
+                n_envs,
+                self.pc_enc_a.out_dim,
+                device=policy_seq.device,
+                dtype=policy_seq.dtype,
+            )
+        else:
+            raise ValueError("predict_lin_vel currently expects zero_pointcloud=True")
+        z = self.memory_a(torch.cat([policy_seq, z_pc], dim=-1))
+        z_last = z[-1] if z.dim() == 3 else z.squeeze(0)
+        return self.vel_decoder(z_last)
+
+    def update_normalization(self, obs): pass
+
+    def load_state_dict(self, state_dict, strict=True):
+        super().load_state_dict(state_dict, strict=strict)
+        return True

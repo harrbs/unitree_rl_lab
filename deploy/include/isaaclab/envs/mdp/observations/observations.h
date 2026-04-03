@@ -4,6 +4,16 @@
 #pragma once
 
 #include "isaaclab/envs/manager_based_rl_env.h"
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <algorithm>
+#include <cstring>
+
+#define UNITREE_PC_SHM_NAME  "/unitree_go2_pointcloud"
+#define UNITREE_PC_NUM_PTS   96
+#define UNITREE_PC_SHM_BYTES (UNITREE_PC_NUM_PTS * 3 * sizeof(float))
 
 namespace isaaclab
 {
@@ -133,6 +143,39 @@ REGISTER_OBSERVATION(gait_phase)
     std::vector<float> obs(2);
     obs[0] = std::sin(env->global_phase * 2 * M_PI);
     obs[1] = std::cos(env->global_phase * 2 * M_PI);
+    return obs;
+}
+
+// ── Point-cloud (Baseline E) ────────────────────────────────────────────────
+// 공유 메모리(unitree_mujoco 브릿지가 기록)에서 96×3=288 float 읽기.
+// MuJoCo가 없는 환경(실제 로봇)에서는 zeros를 반환하므로 별도 처리 필요.
+REGISTER_OBSERVATION(point_cloud)
+{
+    static float*  s_ptr   = nullptr;
+    static bool    s_tried = false;
+
+    // 첫 호출 시 공유 메모리 오픈 시도
+    if (!s_tried) {
+        s_tried = true;
+        int fd = shm_open(UNITREE_PC_SHM_NAME, O_RDONLY, 0666);
+        if (fd >= 0) {
+            void* p = mmap(nullptr, UNITREE_PC_SHM_BYTES, PROT_READ, MAP_SHARED, fd, 0);
+            close(fd);
+            if (p != MAP_FAILED) {
+                s_ptr = static_cast<float*>(p);
+                printf("[point_cloud] shared memory opened: %s\n", UNITREE_PC_SHM_NAME);
+            }
+        }
+        if (!s_ptr) {
+            printf("[point_cloud] WARNING: shared memory not available — returning zeros\n");
+        }
+    }
+
+    constexpr int DIM = UNITREE_PC_NUM_PTS * 3;   // 288
+    std::vector<float> obs(DIM, 0.0f);
+    if (s_ptr) {
+        std::memcpy(obs.data(), s_ptr, DIM * sizeof(float));
+    }
     return obs;
 }
 

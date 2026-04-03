@@ -25,7 +25,7 @@ FSM:
       [0., 0.8, -1.5, 0., 0.8, -1.5, 0., 0.8, -1.5, 0., 0.8, -1.5],
     ]
   Velocity:
-    transitions: 
+    transitions:
       Passive: LT + B.on_pressed
-    policy_dir: ../../../logs/rsl_rl/unitree_go2_velocity
+    policy_dir: ../../../logs/rsl_rl/go2_stair_E_pointcloud/2026-03-29_00-15-27
     

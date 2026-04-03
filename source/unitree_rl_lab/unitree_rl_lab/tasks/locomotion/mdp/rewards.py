@@ -64,6 +64,40 @@ def upward(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("r
     return reward
 
 
+def roll_pitch_orientation_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    pitch_weight: float = 0.25,
+    roll_weight: float = 1.0,
+) -> torch.Tensor:
+    """Penalize roll much more strongly than pitch using projected gravity.
+
+    In Isaac Lab's body frame convention for legged robots:
+      - projected_gravity_b[:, 0] is dominated by pitch deviation
+      - projected_gravity_b[:, 1] is dominated by roll deviation
+
+    Stair climbing requires some fore-aft body pitch, so this term keeps pitch
+    softly regularized while strongly suppressing side-to-side roll.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    pitch_err = torch.square(asset.data.projected_gravity_b[:, 0])
+    roll_err = torch.square(asset.data.projected_gravity_b[:, 1])
+    return pitch_weight * pitch_err + roll_weight * roll_err
+
+
+def roll_pitch_ang_vel_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    pitch_weight: float = 0.25,
+    roll_weight: float = 1.0,
+) -> torch.Tensor:
+    """Penalize roll rate much more strongly than pitch rate."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    roll_rate = torch.square(asset.data.root_ang_vel_b[:, 0])
+    pitch_rate = torch.square(asset.data.root_ang_vel_b[:, 1])
+    return roll_weight * roll_rate + pitch_weight * pitch_rate
+
+
 def joint_position_penalty(
     env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, stand_still_scale: float, velocity_threshold: float
 ) -> torch.Tensor:
@@ -126,6 +160,63 @@ def foot_clearance_reward(
     foot_velocity_tanh = torch.tanh(tanh_mult * torch.norm(asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :2], dim=2))
     reward = foot_z_target_error * foot_velocity_tanh
     return torch.exp(-torch.sum(reward, dim=1) / std)
+
+
+def foot_clearance_reward_terrain_rel(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    target_clearance: float,
+    std: float,
+    tanh_mult: float,
+) -> torch.Tensor:
+    """Reward swinging feet for clearing terrain by target_clearance metres.
+
+    Unlike foot_clearance_reward, this uses terrain-relative clearance estimated
+    from the height scanner, so the signal is meaningful on ascending/descending
+    stairs where absolute world z is misleading.
+
+    The height scanner (top-down, z=20m) provides terrain surface z at each ray
+    hit.  For each foot we find the nearest ray hit in the xy plane and compute:
+        clearance = foot_z_world - terrain_z_below_foot
+
+    Reward fires only on swinging feet (foot moving horizontally), same as the
+    original foot_clearance_reward.
+    """
+    from isaaclab.sensors import RayCaster
+
+    asset: RigidObject = env.scene[asset_cfg.name]
+    sensor: RayCaster = env.scene.sensors[sensor_cfg.name]
+
+    # Foot world positions/velocities: (N, num_feet, 3)
+    foot_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids, :]
+    foot_vel_w = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :]
+
+    # Ray hit positions from height scanner: (N, P, 3)
+    ray_hits = sensor.data.ray_hits_w.clone()
+
+    # Replace invalid (inf/nan) hits with sensor position → neutral signal
+    sensor_pos = sensor.data.pos_w.unsqueeze(1).expand_as(ray_hits)
+    invalid = ~torch.isfinite(ray_hits).all(dim=-1, keepdim=True)
+    ray_hits = torch.where(invalid, sensor_pos, ray_hits)
+
+    # Nearest ray hit (xy plane) for each foot
+    # foot_xy: (N, num_feet, 1, 2)   ray_xy: (N, 1, P, 2)
+    foot_xy = foot_pos_w[:, :, :2].unsqueeze(2)
+    ray_xy  = ray_hits[:, :, :2].unsqueeze(1)
+    dist_sq = ((foot_xy - ray_xy) ** 2).sum(dim=-1)  # (N, num_feet, P)
+    nearest = dist_sq.argmin(dim=-1)                  # (N, num_feet)
+
+    N, num_feet = nearest.shape
+    env_idx   = torch.arange(N, device=env.device).unsqueeze(1).expand_as(nearest)
+    terrain_z = ray_hits[env_idx, nearest, 2]         # (N, num_feet)
+
+    clearance     = foot_pos_w[:, :, 2] - terrain_z   # (N, num_feet)
+    clearance_err = torch.square(clearance - target_clearance)
+
+    foot_vel_tanh = torch.tanh(tanh_mult * torch.norm(foot_vel_w[:, :, :2], dim=-1))
+    reward = clearance_err * foot_vel_tanh
+    return torch.exp(-reward.sum(dim=1) / std)
 
 
 def feet_too_near(
@@ -198,6 +289,137 @@ def feet_gait(
         cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
         reward *= cmd_norm > 0.1
     return reward
+
+
+"""
+Stair rewards.
+"""
+
+
+def _terrain_type_masks(
+    env: ManagerBasedRLEnv,
+    flat_cols: int,
+    ascend_cols: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return flat / ascend / descend masks from terrain column ids."""
+    tt = env.scene.terrain.terrain_types.to(env.device)
+    flat_mask = tt < flat_cols
+    ascend_mask = (tt >= flat_cols) & (tt < flat_cols + ascend_cols)
+    descend_mask = tt >= flat_cols + ascend_cols
+    return flat_mask, ascend_mask, descend_mask
+
+
+def ascend_forward_progress(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    flat_cols: int = 2,
+    ascend_cols: int = 9,
+    max_forward_speed: float = 0.8,
+    max_upward_speed: float = 0.35,
+) -> torch.Tensor:
+    """Reward active forward-and-upward progress on ascending stair terrains.
+
+    This term is intentionally task-specific: it only fires on ascending
+    terrains and only when there is a meaningful planar command. The reward is
+    strongest when the robot moves forward while also generating positive
+    upward motion, which is the behavior missing in plateaued policies.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    _, ascend_mask, _ = _terrain_type_masks(env, flat_cols=flat_cols, ascend_cols=ascend_cols)
+    cmd_xy = torch.linalg.norm(env.command_manager.get_command("base_velocity")[:, :2], dim=1)
+    cmd_active = cmd_xy > 0.05
+
+    forward_speed = torch.clamp(asset.data.root_lin_vel_b[:, 0], min=0.0, max=max_forward_speed)
+    upward_speed = torch.clamp(asset.data.root_lin_vel_w[:, 2], min=0.0, max=max_upward_speed)
+    upward_scale = upward_speed / max(max_upward_speed, 1e-6)
+
+    return ascend_mask.float() * cmd_active.float() * forward_speed * (1.0 + upward_scale)
+
+
+def descend_stable_progress(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    flat_cols: int = 2,
+    ascend_cols: int = 9,
+    max_forward_speed: float = 0.8,
+    orientation_scale: float = 5.0,
+    ang_vel_scale: float = 0.75,
+    pitch_weight: float = 0.6,
+    roll_weight: float = 1.0,
+    pitch_rate_weight: float = 0.75,
+    roll_rate_weight: float = 1.0,
+) -> torch.Tensor:
+    """Reward controlled forward progress on descending stair terrains.
+
+    Descending failures often look like forward face-plants. This term keeps
+    rewarding forward motion, but discounts it when body tilt or roll/pitch
+    rate grow too large, biasing the policy toward composed, deliberate
+    descents instead of diving down the staircase.
+
+    pitch_weight controls how strongly forward body lean is penalised during
+    descent.  Set it low (e.g. 0.08) to allow the natural forward lean that
+    occurs when stepping down stairs.  roll_weight should stay high to prevent
+    sideways toppling.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    _, _, descend_mask = _terrain_type_masks(env, flat_cols=flat_cols, ascend_cols=ascend_cols)
+    cmd_xy = torch.linalg.norm(env.command_manager.get_command("base_velocity")[:, :2], dim=1)
+    cmd_active = cmd_xy > 0.05
+
+    forward_speed = torch.clamp(asset.data.root_lin_vel_b[:, 0], min=0.0, max=max_forward_speed)
+    pitch_err = torch.square(asset.data.projected_gravity_b[:, 0])
+    roll_err = torch.square(asset.data.projected_gravity_b[:, 1])
+    roll_rate = torch.square(asset.data.root_ang_vel_b[:, 0])
+    pitch_rate = torch.square(asset.data.root_ang_vel_b[:, 1])
+
+    stability = torch.exp(
+        -orientation_scale * (pitch_weight * pitch_err + roll_weight * roll_err)
+        -ang_vel_scale * (pitch_rate_weight * pitch_rate + roll_rate_weight * roll_rate)
+    )
+    return descend_mask.float() * cmd_active.float() * forward_speed * stability
+
+
+def lin_vel_z_up(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize upward base linear velocity (positive vz only).
+
+    Unlike lin_vel_z_l2 which penalises all z motion, this only fires when
+    the robot moves upward.  Useful for descend tasks where downward vz is
+    natural and should not be penalised.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    return torch.clamp(asset.data.root_lin_vel_w[:, 2], min=0.0) ** 2
+
+
+def lin_vel_z_down(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize downward base linear velocity (negative vz only).
+
+    Useful for ascend tasks where upward vz is natural and should not be
+    penalised, but downward vz (robot descending after reaching the top)
+    should be suppressed.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    return torch.clamp(-asset.data.root_lin_vel_w[:, 2], min=0.0) ** 2
+
+
+def stair_height_progress(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward upward body velocity — encourages active stair climbing.
+
+    Only fires when the robot has a non-zero forward command so it does not
+    interfere with flat-ground or standing behaviour.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    vz = asset.data.root_lin_vel_w[:, 2]
+    cmd_norm = torch.linalg.norm(env.command_manager.get_command("base_velocity")[:, :2], dim=1)
+    return torch.clamp(vz, min=0.0) * (cmd_norm > 0.1)
 
 
 """
