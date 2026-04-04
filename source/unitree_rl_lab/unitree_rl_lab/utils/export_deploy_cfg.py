@@ -80,31 +80,36 @@ def export_deploy_cfg(env: ManagerBasedRLEnv, log_dir):
             cfg["actions"][action_name]["joint_ids"] = action_term._joint_ids
 
     # --- observations ---
-    obs_names = env.observation_manager.active_terms["policy"]
-    obs_cfgs = env.observation_manager._group_obs_term_cfgs["policy"]
-    obs_terms = zip(obs_names, obs_cfgs)
-    cfg["observations"] = {}
-    for obs_name, obs_cfg in obs_terms:
-        obs_dims = tuple(obs_cfg.func(env, **obs_cfg.params).shape)
-        term_cfg = obs_cfg.copy()
-        if term_cfg.scale is not None:
-            scale = term_cfg.scale.detach().cpu().numpy().tolist()
-            if isinstance(scale, float):
-                term_cfg.scale = [scale for _ in range(obs_dims[1])]
+    def _export_obs_group(group_name: str) -> dict:
+        names = env.observation_manager.active_terms[group_name]
+        cfgs  = env.observation_manager._group_obs_term_cfgs[group_name]
+        result = {}
+        for obs_name, obs_cfg in zip(names, cfgs):
+            raw = obs_cfg.func(env, **obs_cfg.params)
+            flat_dim = raw.reshape(raw.shape[0], -1).shape[1]
+            term_cfg = obs_cfg.copy()
+            if term_cfg.scale is not None:
+                scale = term_cfg.scale.detach().cpu().numpy().tolist()
+                if isinstance(scale, float):
+                    term_cfg.scale = [scale for _ in range(flat_dim)]
+                else:
+                    term_cfg.scale = scale
             else:
-                term_cfg.scale = scale
-        else:
-            term_cfg.scale = [1.0 for _ in range(obs_dims[1])]
-        if term_cfg.clip is not None:
-            term_cfg.clip = list(term_cfg.clip)
-        if term_cfg.history_length == 0:
-            term_cfg.history_length = 1
+                term_cfg.scale = [1.0 for _ in range(flat_dim)]
+            if term_cfg.clip is not None:
+                term_cfg.clip = list(term_cfg.clip)
+            if term_cfg.history_length == 0:
+                term_cfg.history_length = 1
+            term_cfg = term_cfg.to_dict()
+            for _ in ["func", "modifiers", "noise", "flatten_history_dim"]:
+                del term_cfg[_]
+            result[obs_name] = term_cfg
+        return result
 
-        # clean cfg
-        term_cfg = term_cfg.to_dict()
-        for _ in ["func", "modifiers", "noise", "flatten_history_dim"]:
-            del term_cfg[_]
-        cfg["observations"][obs_name] = term_cfg
+    cfg["observations"] = {"policy": _export_obs_group("policy")}
+
+    if "pointcloud" in env.observation_manager.active_terms:
+        cfg["observations"]["point_cloud"] = _export_obs_group("pointcloud")
 
     # --- save config file ---
     filename = os.path.join(log_dir, "params", "deploy.yaml")

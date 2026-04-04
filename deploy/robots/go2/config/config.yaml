@@ -25,7 +25,7 @@ FSM:
       [0., 0.8, -1.5, 0., 0.8, -1.5, 0., 0.8, -1.5, 0., 0.8, -1.5],
     ]
   Velocity:
-    transitions:
+    transitions: 
       Passive: LT + B.on_pressed
-    policy_dir: ../../../logs/rsl_rl/go2_stair_E_pointcloud/2026-03-29_00-15-27
+    policy_dir: ../../../logs/rsl_rl/stair_logs/ascend # change custom policy : 원하는 onnx있는 폴더 선택
     

@@ -3,10 +3,11 @@
 Standalone script — Isaac Lab / AppLauncher 불필요.
 
 ONNX 인터페이스:
-  inputs : obs   [1, 333]   (policy 45 + pointcloud 288)
-           h_in  [1, 1, 256] (GRU hidden state)
+  inputs : policy      [1, 47]    (고유감각: ang_vel 3 + gravity 3 + cmd 3 + jpos 12 + jvel 12 + action 12 + gait 2)
+           point_cloud [1, 288]   (지형 pointcloud: 96 points × 3)
+           h_in        [1, 1, 256] (GRU hidden state)
   outputs: actions [1, 12]
-           h_out  [1, 1, 256]
+           h_out   [1, 1, 256]
 
 사용법:
   python scripts/rsl_rl/export_stair_e.py \\
@@ -30,11 +31,12 @@ sys.path.insert(0, os.path.abspath(_ENCODER_PATH))
 from point_cloud_encoder import PointCloudEncoder  # noqa: E402
 
 # ── 아키텍처 상수 (학습과 반드시 일치) ──────────────────────────────────────
-PROP_DIM    = 45
-PC_DIM      = 288   # 96 points × 3
+PROP_DIM    = 47
+PC_DIM      = 288           # 96 points × 3
 GRU_HIDDEN  = 256
 PC_OUT      = 64
-FUSED_DIM   = GRU_HIDDEN + PC_OUT   # 320
+GRU_IN_DIM  = PROP_DIM + PC_OUT    # 111  — concat(policy, z_pc) → GRU 입력
+FUSED_DIM   = GRU_HIDDEN + PC_OUT  # 320  — concat(z_rnn, z_pc)  → fusion 입력
 NUM_ACTIONS = 12
 
 
@@ -51,8 +53,9 @@ class StairEOnnxWrapper(nn.Module):
     """ONNX export용 래퍼 — actor branch 전용.
 
     C++ OrtRunner 인터페이스:
-        obs   [1, 333]    → GRU(prop) + PointNet(pc) → fusion → actions
-        h_in  [1, 1, 256] → GRU 히든 스테이트 입력
+        policy      [1, 47]    → GRU 입력 (고유감각)
+        point_cloud [1, 288]   → PointNet 입력 (지형 pointcloud)
+        h_in        [1, 1, 256] → GRU 히든 스테이트 입력
         ──────────────────────────────────────────
         actions [1, 12]
         h_out   [1, 1, 256] → 다음 스텝에 h_in 으로 전달
@@ -60,28 +63,28 @@ class StairEOnnxWrapper(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self.gru     = nn.GRU(PROP_DIM, GRU_HIDDEN, num_layers=1, batch_first=False)
+        self.gru     = nn.GRU(GRU_IN_DIM, GRU_HIDDEN, num_layers=1, batch_first=False)
         self.pc_enc  = PointCloudEncoder(num_points=96, out_dim=PC_OUT)
         self.fusion  = _make_mlp(FUSED_DIM, [256, 128])
         self.head    = nn.Linear(128, NUM_ACTIONS)
 
     def forward(
         self,
-        obs: torch.Tensor,          # [1, 333]
+        policy: torch.Tensor,       # [1, 47]
+        point_cloud: torch.Tensor,  # [1, 288]
         h_in: torch.Tensor,         # [1, 1, 256]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        prop = obs[:, :PROP_DIM]    # [1, 45]
-        pc   = obs[:, PROP_DIM:]    # [1, 288]
+        # PointNet: pointcloud → z_pc
+        z_pc = self.pc_enc(point_cloud)                              # [1, 64]
 
-        # GRU: input (seq=1, batch=1, 45), hidden (1, 1, 256)
-        z_rnn, h_out = self.gru(prop.unsqueeze(0), h_in)   # [1,1,256], [1,1,256]
-        z_rnn = z_rnn.squeeze(0)                            # [1, 256]
+        # GRU: input = concat(policy, z_pc), seq=1, batch=1, in=111
+        gru_in = torch.cat([policy, z_pc], dim=-1)                   # [1, 111]
+        z_rnn, h_out = self.gru(gru_in.unsqueeze(0), h_in)          # [1,1,256], [1,1,256]
+        z_rnn = z_rnn.squeeze(0)                                     # [1, 256]
 
-        # PointNet
-        z_pc = self.pc_enc(pc)                              # [1, 64]
-
-        fused   = torch.cat([z_rnn, z_pc], dim=-1)          # [1, 320]
-        actions = self.head(self.fusion(fused))              # [1, 12]
+        # Fusion: concat(z_rnn, z_pc) → actions
+        fused   = torch.cat([z_rnn, z_pc], dim=-1)                   # [1, 320]
+        actions = self.head(self.fusion(fused))                       # [1, 12]
         return actions, h_out
 
 
@@ -120,15 +123,16 @@ def export(ckpt_path: str, out_dir: str) -> str:
     wrapper.eval()
     wrapper.cpu()
 
-    obs_dummy = torch.zeros(1, PROP_DIM + PC_DIM)   # [1, 333]
-    h_dummy   = torch.zeros(1, 1, GRU_HIDDEN)        # [1, 1, 256]
+    policy_dummy = torch.zeros(1, PROP_DIM)      # [1, 47]
+    pc_dummy     = torch.zeros(1, PC_DIM)        # [1, 288]
+    h_dummy      = torch.zeros(1, 1, GRU_HIDDEN) # [1, 1, 256]
 
     torch.onnx.export(
         wrapper,
-        (obs_dummy, h_dummy),
+        (policy_dummy, pc_dummy, h_dummy),
         out_path,
         opset_version=18,
-        input_names=["obs", "h_in"],
+        input_names=["policy", "point_cloud", "h_in"],
         output_names=["actions", "h_out"],
         dynamic_axes={},
     )
