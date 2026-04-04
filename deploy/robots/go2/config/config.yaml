@@ -27,5 +27,5 @@ FSM:
   Velocity:
     transitions: 
       Passive: LT + B.on_pressed
-    policy_dir: ../../../logs/rsl_rl/stair_logs/ascend # change custom policy : 원하는 onnx있는 폴더 선택
+    policy_dir: ../../../logs/rsl_rl/stair_logs/descend # change custom policy : 원하는 onnx있는 폴더 선택
     
