@@ -36,6 +36,7 @@ gym.register(
         "env_cfg_entry_point":      f"{__name__}.stair_ascend_env_cfg:RobotEnvCfg",
         "play_env_cfg_entry_point": f"{__name__}.stair_ascend_env_cfg:RobotPlayEnvCfg",
         "rsl_rl_cfg_entry_point":   f"{_STAIR_AGENTS}:StairAscendPPORunnerCfg",
+        "rsl_rl_baseline_A":        f"{_STAIR_AGENTS}:StairAscendBaselineAPPORunnerCfg",
         "rsl_rl_baseline_E":        f"{_STAIR_AGENTS}:StairAscendPPORunnerCfg",
     },
 )
@@ -48,6 +49,7 @@ gym.register(
         "env_cfg_entry_point":      f"{__name__}.stair_descend_env_cfg:RobotEnvCfg",
         "play_env_cfg_entry_point": f"{__name__}.stair_descend_env_cfg:RobotPlayEnvCfg",
         "rsl_rl_cfg_entry_point":   f"{_STAIR_AGENTS}:StairDescendPPORunnerCfg",
+        "rsl_rl_baseline_A":        f"{_STAIR_AGENTS}:StairDescendBaselineAPPORunnerCfg",
         "rsl_rl_baseline_E":        f"{_STAIR_AGENTS}:StairDescendPPORunnerCfg",
     },
 )

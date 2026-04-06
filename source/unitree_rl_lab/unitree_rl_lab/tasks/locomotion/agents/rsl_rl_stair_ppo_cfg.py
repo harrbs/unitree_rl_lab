@@ -178,6 +178,37 @@ class StairBaselineEPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 @configclass
+class StairAscendBaselineAPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """Baseline A for StairAscend task: prop-only MLP, no exteroception.
+
+    Identical to StairAscendPPORunnerCfg (E) in every training hyperparameter;
+    only the policy architecture and obs_groups differ.  Use this for fair
+    ablation: same env, same rewards, same terrain, same PPO settings.
+    """
+
+    num_steps_per_env = 32       # same as E
+    max_iterations    = 50000
+    save_interval     = 100
+    experiment_name   = "go2_stair_ascend_A"
+
+    obs_groups = {
+        "policy": ["policy"],    # Actor:  47 dim  (prop only, no PC)
+        "critic": ["critic"],    # Critic: 60 dim  (privileged, no PC)
+    }
+
+    policy = RslRlPpoActorCriticCfg(
+        class_name="ActorCritic",
+        init_noise_std=1.0,
+        actor_obs_normalization=False,
+        critic_obs_normalization=False,
+        actor_hidden_dims=[512, 256, 128],
+        critic_hidden_dims=[512, 256, 128],
+        activation="elu",
+    )
+    algorithm = _BASE_ALGORITHM
+
+
+@configclass
 class StairAscendPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """Baseline E for StairAscend task: GRU + PointCloudEncoder."""
 
@@ -200,6 +231,32 @@ class StairAscendPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         critic_obs_normalization=False,
         actor_hidden_dims=[256, 128],
         critic_hidden_dims=[256, 128],
+        activation="elu",
+    )
+    algorithm = _BASE_ALGORITHM
+
+
+@configclass
+class StairDescendBaselineAPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """Baseline A for StairDescend task: prop-only MLP, no exteroception."""
+
+    num_steps_per_env = 32
+    max_iterations    = 50000
+    save_interval     = 100
+    experiment_name   = "go2_stair_descend_A"
+
+    obs_groups = {
+        "policy": ["policy"],
+        "critic": ["critic"],
+    }
+
+    policy = RslRlPpoActorCriticCfg(
+        class_name="ActorCritic",
+        init_noise_std=1.0,
+        actor_obs_normalization=False,
+        critic_obs_normalization=False,
+        actor_hidden_dims=[512, 256, 128],
+        critic_hidden_dims=[512, 256, 128],
         activation="elu",
     )
     algorithm = _BASE_ALGORITHM

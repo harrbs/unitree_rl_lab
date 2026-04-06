@@ -40,6 +40,10 @@ import argparse
 import pathlib
 import sys
 
+# Force line-buffered stdout so progress prints appear immediately,
+# even when Isaac Sim GUI captures/redirects the output stream.
+sys.stdout = open(sys.stdout.fileno(), mode="w", buffering=1, closefd=False)
+
 from isaaclab.app import AppLauncher
 
 sys.path.insert(0, f"{pathlib.Path(__file__).parent.parent}")
@@ -177,7 +181,7 @@ class TerrainMetrics:
             print(f"\n  mean_energy  : {sum(self.energy)/len(self.energy):.4f}  (|τ·ω| mean)")
         if self.stumble:
             print(f"  stumble_rate : {100.*sum(self.stumble)/len(self.stumble):.2f}%  (horiz force > 4×vert)")
-        print(f"{'='*55}\n")
+        print(f"{'='*55}\n", flush=True)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -210,8 +214,13 @@ def _compute_stumble(isaac_env, contact_sensor_name: str = "contact_forces") -> 
 
 
 def _resolve_isaac_env(env):
+    # Try unwrapped first (works with modern IsaacLab gym wrappers)
+    unwrapped = getattr(env, "unwrapped", None)
+    if unwrapped is not None and hasattr(unwrapped, "scene"):
+        return unwrapped
+    # Fall back to manual traversal
     e = env
-    for _ in range(5):
+    for _ in range(8):
         if hasattr(e, "scene"):
             return e
         e = getattr(e, "env", getattr(e, "unwrapped", None))
@@ -265,6 +274,11 @@ def main():
 
     device = agent_cfg.device
     isaac_env = _resolve_isaac_env(env)
+    if isaac_env is None:
+        raise RuntimeError(
+            "Could not resolve isaac_env (no .scene attribute found). "
+            f"env type={type(env)}, unwrapped type={type(getattr(env, 'unwrapped', None))}"
+        )
 
     # ── Load checkpoint ────────────────────────────────────────────────────────
     log_root_path = os.path.abspath(
@@ -297,6 +311,7 @@ def main():
 
     # ── Eval loop ──────────────────────────────────────────────────────────────
     metrics = TerrainMetrics()
+    _last_reported = 0
 
     # Set pc_blend_alpha=1.0 so blended_lidar_pointcloud returns the actual
     # lidar scan (not reference) throughout evaluation.
@@ -304,7 +319,7 @@ def main():
         isaac_env.pc_blend_alpha = 1.0
         env.pc_blend_alpha = 1.0
 
-    obs, _ = env.get_observations()
+    obs = env.get_observations()
     obs = obs.to(device) if not isinstance(obs, dict) else {
         k: v.to(device) for k, v in obs.items()
     }
@@ -323,13 +338,28 @@ def main():
         with torch.inference_mode():
             # ── Blind ablation: zero point cloud ─────────────────────────────
             eval_obs = obs
-            if args_cli.blind_pc and has_pc and isinstance(obs, dict) and "pointcloud" in obs:
-                eval_obs = dict(obs)
-                eval_obs["pointcloud"] = torch.zeros_like(obs["pointcloud"])
+            if args_cli.blind_pc and has_pc:
+                try:
+                    # TensorDict.clone() preserves structure; plain dict falls back
+                    eval_obs = obs.clone() if hasattr(obs, "clone") else {k: v for k, v in obs.items()}
+                    eval_obs["pointcloud"] = torch.zeros_like(obs["pointcloud"])
+                except (KeyError, AttributeError):
+                    pass  # no pointcloud key — flag has no effect
 
             actions = policy_nn.act_inference(eval_obs)
 
+        # ── Capture pre-step state (env auto-resets done envs inside step) ────
+        if isaac_env is not None:
+            pre_z   = _get_base_z(isaac_env).to(device)
+            pre_pos = isaac_env.scene["robot"].data.root_pos_w[:, :2].clone().to(device)
+            pre_cmd = torch.norm(
+                isaac_env.command_manager.get_command("base_velocity")[:, :2].to(device),
+                dim=1,
+            )
+            pre_cols = _col_label_batch(_get_terrain_col(isaac_env, device))
+
         obs, _rewards, dones, extras = env.step(actions)
+        dones = dones.to(device)
         obs = obs.to(device) if not isinstance(obs, dict) else {
             k: v.to(device) for k, v in obs.items()
         }
@@ -347,19 +377,12 @@ def main():
         done_ids  = dones_cpu.nonzero(as_tuple=False).squeeze(-1)
 
         if len(done_ids) > 0 and isaac_env is not None:
-            cur_z   = _get_base_z(isaac_env).to(device)
-            delta_z = cur_z - ep_start_z
-            cols    = _col_label_batch(_get_terrain_col(isaac_env, device))
-
-            cur_pos  = isaac_env.scene["robot"].data.root_pos_w[:, :2].to(device)
-            origins  = isaac_env.scene.terrain.env_origins[:, :2].to(device)
-            fwd_dist = torch.norm(cur_pos - origins, dim=1)
-            cmd      = torch.norm(
-                isaac_env.command_manager.get_command("base_velocity")[:, :2].to(device),
-                dim=1,
-            )
+            # Use pre-step positions: env has already reset done envs by now
+            delta_z = pre_z - ep_start_z
+            origins = isaac_env.scene.terrain.env_origins[:, :2].to(device)
+            fwd_dist = torch.norm(pre_pos - origins, dim=1)
             progress_ok = fwd_dist > torch.clamp(
-                cmd * float(isaac_env.max_episode_length_s) * 0.3, min=0.5
+                pre_cmd * float(isaac_env.max_episode_length_s) * 0.3, min=0.5
             )
 
             for i in done_ids.tolist():
@@ -372,16 +395,21 @@ def main():
                 else:
                     success = to and prog and dz < -0.05
 
-                metrics.record_episode(cols[i], success, to)
+                metrics.record_episode(pre_cols[i], success, to)
 
-            # Reset starting z for done envs
-            ep_start_z[done_ids] = cur_z[done_ids]
+            # Reset starting z for done envs using pre-step z of the new episode
+            # (post-step z is already the reset position, which is what we want)
+            post_z = _get_base_z(isaac_env).to(device)
+            ep_start_z[done_ids] = post_z[done_ids]
 
         # Reset GRU hidden state for done environments
-        policy_nn.reset(dones.to(device))
+        with torch.inference_mode():
+            policy_nn.reset(dones)
 
-        if metrics.total_episodes() % 50 == 0 and metrics.total_episodes() > 0:
-            print(f"  collected {metrics.total_episodes()} / {args_cli.n_episodes} episodes ...")
+        total = metrics.total_episodes()
+        if total // 50 > _last_reported // 50 and total > 0:
+            _last_reported = total
+            print(f"  collected {total} / {args_cli.n_episodes} episodes ...", flush=True)
 
     # ── Report ─────────────────────────────────────────────────────────────────
     mode_label = (
@@ -390,6 +418,27 @@ def main():
         else f"Baseline-{args_cli.baseline} (normal)"
     )
     metrics.print_table(mode_label)
+
+    # Save results to a dedicated file (independent of stdout/stderr buffering)
+    import io as _io
+    _buf = _io.StringIO()
+    _orig_stdout = sys.stdout
+    sys.stdout = _buf
+    metrics.print_table(mode_label)
+    sys.stdout = _orig_stdout
+    _result_text = _buf.getvalue()
+
+    _tag = "blind" if args_cli.blind_pc else args_cli.baseline
+    _result_path = os.path.join(
+        os.path.dirname(resume_path),
+        f"eval_{args_cli.task.split('-')[-1].lower()}_{_tag}.txt"
+    )
+    with open(_result_path, "w") as _f:
+        _f.write(f"checkpoint: {resume_path}\n")
+        _f.write(f"n_episodes: {args_cli.n_episodes}\n")
+        _f.write(f"speed: {args_cli.force_lin_vel_x} m/s\n\n")
+        _f.write(_result_text)
+    print(f"\n[eval_stair] Results saved to: {_result_path}", flush=True)
 
     env.close()
 
