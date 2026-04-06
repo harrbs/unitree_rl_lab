@@ -417,6 +417,7 @@ class TerminationsCfg:
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 1.0},
     )
     bad_orientation = DoneTerm(func=mdp.bad_orientation, params={"limit_angle": 0.8})
+    out_of_tile = DoneTerm(func=mdp.radial_distance_from_origin_exceeds, params={"maximum_distance": 4.0})
 
 
 @configclass

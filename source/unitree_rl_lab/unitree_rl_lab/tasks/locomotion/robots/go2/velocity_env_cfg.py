@@ -353,6 +353,7 @@ class TerminationsCfg:
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 1.0},
     ) # 베이스가 지면과 접촉하면 종료(넘어짐/주저앉음)
     bad_orientation = DoneTerm(func=mdp.bad_orientation, params={"limit_angle": 0.8}) # 기울기 각이 0.8 rad(약 45.8도) 이상이면 종료
+    out_of_tile = DoneTerm(func=mdp.radial_distance_from_origin_exceeds, params={"maximum_distance": 4.0})
 
 
 @configclass

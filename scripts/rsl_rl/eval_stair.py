@@ -120,12 +120,43 @@ _TERRAIN_BINS = {
     "hard":   (8, 9),
 }
 
+_STAIR_GEOM = {
+    "tiny":   {"step_height_range": (0.02, 0.06), "step_width": 0.45},
+    "medium": {"step_height_range": (0.05, 0.15), "step_width": 0.35},
+    "hard":   {"step_height_range": (0.10, 0.25), "step_width": 0.30},
+}
+_TERRAIN_SIZE_X = 8.0
+_PLATFORM_WIDTH = 2.0
+_STAIR_HEIGHT_SUCCESS_RATIO = 0.8
+
 
 def _col_label(col: int) -> str:
     for label, (lo, hi) in _TERRAIN_BINS.items():
         if lo <= col <= hi:
             return label
     return "unknown"
+
+
+def _compute_success(
+    *,
+    isaac_env,
+    terrain_label: str,
+    terrain_level: int,
+    is_ascend: bool,
+    timed_out: bool,
+    progress_ok: bool,
+    delta_z: float,
+) -> bool:
+    """Use terrain-aware success criteria with per-tile total stair height."""
+    if not (timed_out and progress_ok):
+        return False
+
+    if terrain_label == "flat":
+        return True
+
+    target_height = _target_stair_height(isaac_env, terrain_label, terrain_level)
+    signed_target = target_height if is_ascend else -target_height
+    return delta_z >= signed_target if is_ascend else delta_z <= signed_target
 
 
 # ── Metric accumulator ─────────────────────────────────────────────────────────
@@ -192,6 +223,26 @@ def _get_base_z(isaac_env) -> torch.Tensor:
 
 def _get_terrain_col(isaac_env, device) -> torch.Tensor:
     return isaac_env.scene.terrain.terrain_types.to(device)
+
+
+def _get_terrain_level(isaac_env, device) -> torch.Tensor:
+    return isaac_env.scene.terrain.terrain_levels.to(device)
+
+
+def _target_stair_height(isaac_env, terrain_label: str, terrain_level: int) -> float:
+    """Estimate the total rise/drop of the assigned stair tile for eval success."""
+    if terrain_label == "flat":
+        return 0.0
+
+    geom = _STAIR_GEOM[terrain_label]
+    num_rows = int(isaac_env.scene.terrain.terrain_generator.num_rows)
+    difficulty = 0.0 if num_rows <= 1 else float(terrain_level) / float(num_rows - 1)
+
+    min_h, max_h = geom["step_height_range"]
+    step_height = min_h + difficulty * (max_h - min_h)
+    stair_run = (_TERRAIN_SIZE_X * 0.5) - (_PLATFORM_WIDTH * 0.5)
+    n_steps = max(1, int(stair_run / float(geom["step_width"])))
+    return _STAIR_HEIGHT_SUCCESS_RATIO * n_steps * step_height
 
 
 def _compute_energy(isaac_env) -> float:
@@ -357,6 +408,7 @@ def main():
                 dim=1,
             )
             pre_cols = _col_label_batch(_get_terrain_col(isaac_env, device))
+            pre_levels = _get_terrain_level(isaac_env, device)
 
         obs, _rewards, dones, extras = env.step(actions)
         dones = dones.to(device)
@@ -385,17 +437,28 @@ def main():
                 pre_cmd * float(isaac_env.max_episode_length_s) * 0.3, min=0.5
             )
 
+            remaining = args_cli.n_episodes - metrics.total_episodes()
+            if remaining <= 0:
+                break
+            done_ids = done_ids[:remaining]
+
             for i in done_ids.tolist():
                 to   = bool(time_outs[i])
                 prog = bool(progress_ok[i])
                 dz   = float(delta_z[i])
+                terrain_label = pre_cols[i]
 
-                if is_ascend:
-                    success = to and prog and dz > 0.05
-                else:
-                    success = to and prog and dz < -0.05
+                success = _compute_success(
+                    isaac_env=isaac_env,
+                    terrain_label=terrain_label,
+                    terrain_level=int(pre_levels[i]),
+                    is_ascend=is_ascend,
+                    timed_out=to,
+                    progress_ok=prog,
+                    delta_z=dz,
+                )
 
-                metrics.record_episode(pre_cols[i], success, to)
+                metrics.record_episode(terrain_label, success, to)
 
             # Reset starting z for done envs using pre-step z of the new episode
             # (post-step z is already the reset position, which is what we want)
